@@ -1,0 +1,271 @@
+#include <Wiegand.h>
+#include <EEPROM.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+#define WIEGAND_PIN_D0 16
+#define WIEGAND_PIN_D1 17
+#define RFID_LED_PIN 18
+#define MODE_SWITCH_PIN 19
+#define CLEAR_DATA_PIN 21
+#define PULSE_PIN 22
+#define BUZZER_PIN 23
+
+#define BUTTON_PRESS_TIME_FOR_MODE_CHANGE 5000
+#define BUTTON_PRESS_TIME_FOR_MEMORY_CLEAR 10000
+
+WIEGAND wg;
+
+enum OperationMode {
+  VERIFICATION_MODE,
+  REGISTRATION_MODE,
+  CLEAR_MODE
+};
+
+OperationMode currentMode = VERIFICATION_MODE;
+bool lastButtonState = LOW;
+volatile bool accessGranted = false;
+unsigned long buttonPressStartTime = 0;
+bool buttonWasPressed = false;
+
+const int MAX_CARDS = 100;
+int cardCount = 0;
+
+struct Card {
+  uint32_t id;
+  char name[16];
+};
+
+Card cardDatabase[MAX_CARDS];
+
+BLECharacteristic *pCharacteristic;
+
+void setup() {
+  Serial.begin(9600);
+  EEPROM.begin(512);
+  wg.begin(WIEGAND_PIN_D0, WIEGAND_PIN_D1);
+
+  setupPins();
+  loadDatabase();
+
+  // Configuração do BLE
+  BLEDevice::init("ESP32 iBeacon");
+  BLEServer *pServer = BLEDevice::createServer();
+  BLEService *pService = pServer->createService(BLEUUID("542ef788-b2b0-4808-830a-53ef19f26e00"));
+  pCharacteristic = pService->createCharacteristic(
+    BLEUUID("e6f71c06-f7bb-4110-b540-70df4aef6863"),
+    BLECharacteristic::PROPERTY_READ |
+    BLECharacteristic::PROPERTY_WRITE |
+    BLECharacteristic::PROPERTY_NOTIFY
+  );
+  pCharacteristic->addDescriptor(new BLE2902());
+  pService->start();
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(BLEUUID("542ef788-b2b0-4808-830a-53ef19f26e00"));
+  pAdvertising->start();
+}
+
+void loop() {
+  checkModeSwitch();
+  checkClearData();
+
+  if (wg.available()) {
+    uint32_t id = wg.getCode();
+    Serial.print("Cartão lido: HEX = ");
+    Serial.print(id, HEX);
+    Serial.print(", DECIMAL = ");
+    Serial.println(id);
+    
+    handleData(id);
+
+    dumpState();
+  }
+
+  if (accessGranted) {
+    accessGranted = false;
+    grantAccess();
+  }
+
+  delay(100);
+}
+
+void setupPins() {
+  pinMode(WIEGAND_PIN_D0, INPUT);
+  pinMode(WIEGAND_PIN_D1, INPUT);
+  pinMode(MODE_SWITCH_PIN, INPUT_PULLUP);
+  pinMode(CLEAR_DATA_PIN, INPUT_PULLUP);
+  pinMode(PULSE_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(RFID_LED_PIN, OUTPUT);
+
+  digitalWrite(PULSE_PIN, LOW);
+  digitalWrite(BUZZER_PIN, HIGH);
+  digitalWrite(RFID_LED_PIN, HIGH);
+}
+
+void checkModeSwitch() {
+  bool buttonState = digitalRead(MODE_SWITCH_PIN);
+
+  if (buttonState == LOW) {
+    if (!buttonWasPressed) {
+      buttonPressStartTime = millis();
+      buttonWasPressed = true;
+    } else {
+      unsigned long pressDuration = millis() - buttonPressStartTime;
+
+      if (pressDuration >= BUTTON_PRESS_TIME_FOR_MEMORY_CLEAR) {
+        clearDatabase();
+        sendBips(4);
+        pCharacteristic->setValue("Memory Cleared");
+        pCharacteristic->notify();
+        buttonWasPressed = false;
+      }
+    }
+  } else {
+    if (buttonWasPressed) {
+      unsigned long pressDuration = millis() - buttonPressStartTime;
+
+      if (pressDuration >= BUTTON_PRESS_TIME_FOR_MODE_CHANGE && pressDuration < BUTTON_PRESS_TIME_FOR_MEMORY_CLEAR) {
+        toggleMode();
+        sendBips(3);
+      } else if (pressDuration < BUTTON_PRESS_TIME_FOR_MODE_CHANGE) {
+        if (currentMode == REGISTRATION_MODE) {
+          toggleMode();
+        }
+      }
+      buttonWasPressed = false;
+    }
+  }
+}
+
+void sendBips(int count) {
+  for (int i = 0; i < count; i++) {
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(250);
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(250);
+  }
+}
+
+void checkClearData() {
+  if (digitalRead(CLEAR_DATA_PIN) == LOW) {
+    clearDatabase();
+    pCharacteristic->setValue("memoria limpa");
+    pCharacteristic->notify();
+    delay(500);
+  }
+}
+
+void handleData(uint32_t id) {
+  switch (currentMode) {
+    case VERIFICATION_MODE:
+      if (findCard(id) != -1) {
+        accessGranted = true;
+        pCharacteristic->setValue("Acesso permitido");
+        pCharacteristic->notify();
+        Serial.println("Cartão encontrado no banco de dados.");
+      } else {
+        pCharacteristic->setValue("Acesso negado");
+        pCharacteristic->notify();
+        Serial.println("Cartão não encontrado no banco de dados.");
+      }
+      break;
+
+    case REGISTRATION_MODE:
+      if (addCard(id, "Cartao")) {
+        Serial.println("Cartão registrado com sucesso!");
+      } else {
+        Serial.println("Falha ao registrar o cartão.");
+      }
+      break;
+  }
+}
+
+void dumpState() {
+  Serial.print("count = ");
+  Serial.print(cardCount);
+  Serial.print(" [");
+
+  for (int i = 0; i < cardCount; i++) {
+    Serial.print(cardDatabase[i].id);
+    Serial.print(":");
+    Serial.print(cardDatabase[i].name);
+    if (i < cardCount - 1) {
+      Serial.print(", ");
+    }
+  }
+  Serial.println("]");
+}
+
+void toggleMode() {
+  currentMode = (currentMode == VERIFICATION_MODE) ? REGISTRATION_MODE : VERIFICATION_MODE;
+  const char *modeMessage = currentMode == VERIFICATION_MODE ? "Verification Mode" : "Registration Mode";
+
+  pCharacteristic->setValue(modeMessage);
+  pCharacteristic->notify();
+
+  Serial.println(modeMessage);
+}
+
+void clearDatabase() {
+  Serial.println("Limpando todos os dados do banco de dados...");
+  cardCount = 0;
+  saveDatabase();
+  Serial.println("Banco de dados limpo.");
+
+  digitalWrite(BUZZER_PIN, LOW);
+  delay(750);
+  digitalWrite(BUZZER_PIN, HIGH);
+}
+
+void grantAccess() {
+  digitalWrite(RFID_LED_PIN, LOW);
+  for (int i = 0; i < 1; i++) {
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(250);
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(125);
+  }
+
+  digitalWrite(RFID_LED_PIN, HIGH);
+}
+
+bool addCard(uint32_t id, const char* name) {
+  if (cardCount < MAX_CARDS) {
+    cardDatabase[cardCount].id = id;
+    strncpy(cardDatabase[cardCount].name, name, sizeof(cardDatabase[cardCount].name));
+    cardDatabase[cardCount].name[sizeof(cardDatabase[cardCount].name) - 1] = '\0';
+    cardCount++;
+    saveDatabase();
+    return true;
+  }
+  return false;
+}
+
+int findCard(uint32_t id) {
+  for (int i = 0; i < cardCount; i++) {
+    if (cardDatabase[i].id == id) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+void saveDatabase() {
+  EEPROM.put(0, cardCount);
+  for (int i = 0; i < cardCount; i++) {
+    EEPROM.put(sizeof(int) + i * sizeof(Card), cardDatabase[i]);
+  }
+  EEPROM.commit();
+}
+
+void loadDatabase() {
+  cardCount = EEPROM.get(0, cardCount);
+  for (int i = 0; i < cardCount; i++) {
+    EEPROM.get(sizeof(int) + i * sizeof(Card), cardDatabase[i]);
+  }
+}
+
+
